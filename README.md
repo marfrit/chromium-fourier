@@ -42,24 +42,34 @@ on a "boring upstream Linux" stack.
 chromium-fourier/
 ├── README.md
 ├── LICENSE
-└── pinetab2/                  # RK3566 (Mali-G52 panfrost) — done
+├── docs/
+│   └── playback-howto.md      # mainline V4L2 video playback (mpv,
+│                              # gstreamer, ffplay) — the dmabuf wall
+├── pinetab2/                  # RK3566 (Mali-G52 panfrost) — validated
+│   ├── PKGBUILD
+│   └── patches/
+│       ├── enable-v4l2-decoder-default.patch
+│       └── wayland-allow-direct-egl-gles2.patch
+└── rk3588/                    # RK3588 (Mali-G610 panthor) — scaffolded
     ├── PKGBUILD
-    └── patches/
+    └── patches/               # same two patches as pinetab2/
         ├── enable-v4l2-decoder-default.patch
         └── wayland-allow-direct-egl-gles2.patch
 ```
 
-Future sibling subdirectories:
+Per-board status:
 
-- **`rk3588/`** — RK3588 / RK3588S (Mali-G610 Valhall, panthor; VDPU381
-  for AV1 / VP9 / HEVC). Stateless V4L2 driver in mainline (`hantro`
-  for H.264; `rkvdec2` for AV1) is still maturing — the
-  `chromium-fourier` patches should apply unchanged but the gn args
-  may pick up additional `proprietary_codecs` / `enable_av1_decoder`
-  lines once the kernel side is stable.
-- **`rk3399/`** — Mali-T860 (older Midgard panfrost; H.264 only via
-  hantro). Same patches; the launcher's Vulkan-default-disabled stance
-  is correct here too (panfrost on Midgard has no Vulkan path).
+- **`pinetab2/`** — **validated end-to-end** on PineTab2 (RK3566 /
+  Mali-G52 Bifrost / panfrost). 1080p30 H.264 plays at ~46 % combined
+  CPU vs ~85 % renderer-only with the stock fallback.
+- **`rk3588/`** — scaffolded; same patches, same gn args. **Validation
+  pending on RK3588 hardware** (Mali-G610 Valhall / panthor + panvk
+  for Vulkan, `hantro` for H.264, `rkvdec2` for AV1 / HEVC / VP9).
+  Differences vs PineTab2 are launcher-only: Vulkan stays enabled
+  because panvk on Valhall is functional.
+- **`rk3399/`** (planned) — Pinebook Pro / Rock Pi 4 / etc.
+  Mali-T860 Midgard panfrost; H.264 only via `hantro`. Same patches;
+  Vulkan-default-disabled stance correct (Midgard has no Vulkan).
 
 A separate Firefox-side effort (different patch shape — Firefox has
 its own `media-rdd` / `RemoteVideoDecoder` plumbing for V4L2) will
@@ -168,6 +178,14 @@ actually works:
 
 The launcher detects any of those on the command line and skips its
 own `--disable-features=Vulkan`, so the user's intent always wins.
+
+## Adjacent: playing video outside the browser
+
+If you only want to watch H.264 / HEVC / VP9 / AV1 files from the
+command line (mpv, gstreamer, ffmpeg), see
+[`docs/playback-howto.md`](docs/playback-howto.md). Same hardware, same
+underlying V4L2 stack, separate dmabuf wall — that doc captures the
+working invocations and what the wall is.
 
 ## Validation
 

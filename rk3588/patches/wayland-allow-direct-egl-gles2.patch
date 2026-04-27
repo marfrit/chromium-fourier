@@ -1,0 +1,57 @@
+From: Markus Fritsche <mfritsche@reauktion.de>
+Subject: ozone/wayland: re-allow direct EGL/GLES2 path (no ANGLE shim)
+Date: 2026-04-26
+
+Background
+----------
+On Wayland-only ozone builds the surface factory currently advertises only
+ANGLE-mediated GL implementations (`kOpenGL`, `kOpenGLES`, `kSwiftShader`,
+`kVulkan`). Anything driving `--use-gl=egl` (the historical
+`kGLImplementationEGLGLES2`) is rejected at startup with
+
+    Requested GL implementation (gl=egl-gles2,angle=none) not found in
+    allowed implementations: [(gl=egl-angle,angle=opengl|opengles|...)]
+
+The downstream switch already handles `kGLImplementationEGLGLES2` in
+`GetGLOzone`, so the dispatcher is wired -- it's the *advertisement* that
+got tightened.
+
+The cost of that tightening on RK3566 hantro / panfrost is real: with
+ANGLE in the path, chrome's display-side EGL is ANGLE's own EGL. ANGLE's
+GLES backend on Linux does not propagate
+`EGL_EXT_image_dma_buf_import` through to the chrome GL display, so
+`gpu_feature_info.supports_nv12_gl_native_pixmap` ends up false. That in
+turn forces the V4L2-decoded NV12 frames through the
+NV12-to-AR24 VPP conversion path before they hit the compositor, costing
+~85 % CPU at 1080p30 even though the hantro VPU is doing the actual
+decode for free.
+
+Allowing the direct EGL/GLES2 path back means chrome's EGL is panfrost's
+EGL (via mesa), which exposes the dmabuf-import extensions natively, and
+the zero-copy NV12 native pixmap path lights up.
+
+Fix
+---
+Add `kGLImplementationEGLGLES2` to the head of the allowed list; ANGLE
+remains the default fallback and is still selected when the user passes
+`--use-gl=angle ...`. The position is deliberate: on a USE_V4L2_CODEC
+hardware-decode build the user almost always wants the dmabuf-capable
+direct path; ANGLE is still there for browsers that need its conformance
+fixups.
+
+This does not affect non-Wayland ozone backends.
+
+diff --git a/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc b/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc
+--- a/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc
++++ b/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc
+@@ -223,6 +223,10 @@ std::vector<gl::GLImplementationParts>
+ WaylandSurfaceFactory::GetAllowedGLImplementations() {
+   std::vector<gl::GLImplementationParts> impls;
+   if (egl_implementation_) {
++    // chromium-fourier: keep the direct EGL/GLES2 path available so
++    // panfrost's EGL_EXT_image_dma_buf_import surfaces to chrome's GL
++    // display layer. See patch header for rationale.
++    impls.emplace_back(gl::GLImplementationParts(gl::kGLImplementationEGLGLES2));
+     impls.emplace_back(gl::ANGLEImplementation::kOpenGL);
+     impls.emplace_back(gl::ANGLEImplementation::kOpenGLES);
+     impls.emplace_back(gl::ANGLEImplementation::kSwiftShader);

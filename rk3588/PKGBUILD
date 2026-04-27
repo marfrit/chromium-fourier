@@ -1,0 +1,240 @@
+# Maintainer: Markus Fritsche <mfritsche@reauktion.de>
+#
+# Chromium with V4L2 HW video decode unlocked on Linux for Rockchip
+# **RK3588** / Mali-G610 (Valhall) / panthor + panvk — H.264 on
+# `hantro`; AV1 / HEVC / VP9 on `rkvdec2`. Mainline kernel + Wayland.
+# No vendor MPP, no Mali blob, no panfork, no 5.10 BSP. See
+# ../README.md for the project rationale; see the patch headers for
+# diagnosis notes.
+#
+# Status: **scaffolded, validation pending on ampere (Arch / RK3588
+# CoolPi)**. Same patches as ../pinetab2/, same gn args. Differences
+# vs PineTab2 are runtime-only (panthor instead of panfrost on the
+# kernel side; panvk is functional on Valhall, so the launcher does
+# not auto-disable Vulkan).
+#
+# Multi-arch: builds natively on x86_64 and aarch64. The x86_64 path
+# is primarily a development / CI host; the runtime target audience is
+# aarch64. The two patches are architecture-independent.
+
+pkgname=chromium-fourier
+pkgver=147.0.7727.116
+pkgrel=1
+epoch=1
+pkgdesc='Chromium with V4L2VDA HW video decode unlocked for mainline Linux Wayland on Rockchip'
+arch=('aarch64' 'x86_64')
+url='https://www.chromium.org/Home'
+license=('BSD-3-Clause')
+depends=(
+  alsa-lib
+  at-spi2-core
+  cairo
+  cups
+  dbus
+  fontconfig
+  freetype2
+  gtk3
+  hicolor-icon-theme
+  libdrm
+  libpulse
+  libva
+  libxcb
+  libxkbcommon
+  mesa
+  nspr
+  nss
+  pango
+  pciutils
+  pipewire
+  ttf-liberation
+  v4l-utils
+  wayland
+)
+makedepends=(
+  clang
+  elfutils
+  gn
+  gperf
+  java-runtime-headless
+  libxslt
+  lld
+  ninja
+  nodejs
+  npm
+  python
+  qt5-base
+  qt6-base
+  re2
+  rust
+  rust-bindgen
+)
+optdepends=(
+  'qt6-base: for Qt6 toolkit integration'
+)
+provides=(chromium)
+conflicts=(chromium)
+options=('!lto' '!strip')
+
+# Canonical chromium release tarball (5.7 GB compressed). Versions track
+# the chromium release schedule (see https://chromiumdash.appspot.com).
+# When bumping pkgver the patches may need their hunk line numbers
+# refreshed against the new tree — they are written against
+# media/base/media_switches.cc and ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc
+# which both move around between minor releases.
+source=(
+  "https://commondatastorage.googleapis.com/chromium-browser-official/chromium-${pkgver}.tar.xz"
+  'patches/enable-v4l2-decoder-default.patch'
+  'patches/wayland-allow-direct-egl-gles2.patch'
+)
+sha256sums=(
+  'SKIP'
+  'SKIP'
+  'SKIP'
+)
+
+prepare() {
+  cd "${srcdir}/chromium-${pkgver}"
+
+  # Fourier patch 1/2: flip kAcceleratedVideoDecodeLinux's default to
+  # enabled when USE_V4L2_CODEC is the build's HW decode path. Without
+  # this the runtime master gate stays off on USE_V4L2_CODEC-only builds
+  # and chrome silently falls back to ffmpeg software decode. See the
+  # patch header for the validation log on RK3566 hantro.
+  patch -Np1 -i "${srcdir}/patches/enable-v4l2-decoder-default.patch"
+
+  # Fourier patch 2/2: re-allow the direct EGL/GLES2 path in the Wayland
+  # ozone surface factory so panfrost's EGL_EXT_image_dma_buf_import
+  # surfaces to chrome's GL display, lighting up the NV12 zero-copy
+  # native-pixmap pipeline. The launcher defaults to ANGLE (DCHECK in
+  # gl_context_egl.cc:241 fires on direct EGL with non-official builds);
+  # this patch keeps the direct path available for users who flip
+  # is_official_build=true and want the lower-CPU pipeline.
+  patch -Np1 -i "${srcdir}/patches/wayland-allow-direct-egl-gles2.patch"
+
+  # Use system node, system java
+  case "$CARCH" in
+    aarch64) _node_dir=node-linux-arm64 ;;
+    x86_64)  _node_dir=node-linux-x64 ;;
+  esac
+  rm -f "third_party/node/linux/${_node_dir}/bin/node"
+  mkdir -p "third_party/node/linux/${_node_dir}/bin"
+  ln -sf /usr/bin/node "third_party/node/linux/${_node_dir}/bin/"
+  ln -sf /usr/bin/java third_party/jdk/current/bin/ 2>/dev/null || true
+}
+
+build() {
+  cd "${srcdir}/chromium-${pkgver}"
+
+  case "$CARCH" in
+    aarch64) _target_cpu="arm64" ;;
+    x86_64)  _target_cpu="x64"   ;;
+  esac
+
+  local _flags=(
+    "target_cpu=\"${_target_cpu}\""
+
+    'is_official_build=false'
+    'is_debug=false'
+    # dcheck_always_on defaults to !is_official_build (true here);
+    # explicitly off so the direct EGL/GLES2 path doesn't FATAL on
+    # gl_context_egl.cc:241's DCHECK(!global_texture_share_group_).
+    'dcheck_always_on=false'
+    'symbol_level=0'
+    'is_cfi=false'
+    'treat_warnings_as_errors=false'
+    'enable_nacl=false'
+    'enable_widevine=false'
+
+    # System toolchain (clang/lld from pacman)
+    'custom_toolchain="//build/toolchain/linux/unbundle:default"'
+    'host_toolchain="//build/toolchain/linux/unbundle:default"'
+    'use_sysroot=false'
+    'use_custom_libcxx=true'
+
+    # The whole point of chromium-fourier — V4L2 HW decode on Linux
+    'use_v4l2_codec=true'
+    'use_v4lplugin=true'
+    'use_linux_v4l2_only=true'
+    'use_vaapi=false'
+
+    # Codec branding for proprietary codec support (H.264 etc.)
+    'ffmpeg_branding="Chrome"'
+    'proprietary_codecs=true'
+
+    'rtc_use_pipewire=true'
+    'link_pulseaudio=true'
+    'use_qt6=true'
+    'moc_qt6_path="/usr/lib/qt6"'
+  )
+
+  gn gen out/Default --args="${_flags[*]}"
+  ninja -C out/Default chrome chrome_crashpad_handler
+}
+
+package() {
+  cd "${srcdir}/chromium-${pkgver}"
+
+  install -Dm755 out/Default/chrome "${pkgdir}/usr/lib/chromium/chromium"
+  install -Dm755 out/Default/chrome_crashpad_handler \
+    "${pkgdir}/usr/lib/chromium/chrome_crashpad_handler"
+  [ -f out/Default/chrome_sandbox ] && install -Dm4755 out/Default/chrome_sandbox \
+    "${pkgdir}/usr/lib/chromium/chrome-sandbox"
+  [ -f out/Default/chromedriver ] && install -Dm755 out/Default/chromedriver \
+    "${pkgdir}/usr/bin/chromedriver"
+
+  # Bundled GL/Vulkan runtime — chrome dlopens these from its own dir,
+  # not /usr/lib/. Without them GL init fails and chrome falls back to
+  # software compositing.
+  for so in libEGL.so libGLESv2.so libvk_swiftshader.so libvulkan.so.1; do
+    [ -f "out/Default/$so" ] && install -Dm755 "out/Default/$so" \
+      "${pkgdir}/usr/lib/chromium/$so"
+  done
+  # ANGLE and SwiftShader ICD config files
+  for icd in out/Default/*_icd.json; do
+    [ -f "$icd" ] && install -Dm644 "$icd" \
+      "${pkgdir}/usr/lib/chromium/$(basename "$icd")"
+  done
+
+  # Resources / locales / pak files
+  for f in chrome_100_percent.pak chrome_200_percent.pak resources.pak \
+           v8_context_snapshot.bin snapshot_blob.bin icudtl.dat \
+           headless_lib_data.pak headless_lib_strings.pak \
+           headless_command_resources.pak; do
+    [ -f "out/Default/$f" ] && install -Dm644 "out/Default/$f" \
+      "${pkgdir}/usr/lib/chromium/$f"
+  done
+
+  # Locales
+  if [ -d out/Default/locales ]; then
+    install -dm755 "${pkgdir}/usr/lib/chromium/locales"
+    cp -r out/Default/locales/* "${pkgdir}/usr/lib/chromium/locales/"
+  fi
+
+  # Launcher shim — defaults to ANGLE→GLES on Wayland with Vulkan
+  # left ENABLED. On RK3588 / Mali-G610 / panthor the Vulkan stack
+  # (panvk) is functional, so chromium can use it for skia-graphite
+  # raster and ANGLE→Vulkan if the user opts in via
+  # `--use-angle=vulkan`. The PineTab2 / RK3566 sibling defaults to
+  # `--disable-features=Vulkan` because panvk on G52-Bifrost returns
+  # VK_ERROR_INCOMPATIBLE_DRIVER and breaks V4L2 dispatch — that
+  # situation does not apply here.
+  #
+  # User overrides:
+  #   --use-angle=vulkan               run ANGLE on Vulkan (recommended)
+  #   --disable-features=Vulkan        force the GL path (debug / fallback)
+  install -dm755 "${pkgdir}/usr/bin"
+  cat > "${pkgdir}/usr/bin/chromium" <<'LAUNCHER'
+#!/bin/bash
+# chromium-fourier launcher (RK3588) — V4L2 HW decode + Wayland +
+# ANGLE→GLES on panthor. Vulkan stays enabled (panvk works on G610);
+# pass --use-angle=vulkan to route ANGLE through Vulkan, or
+# --disable-features=Vulkan to fall back to the GL-only path.
+
+exec /usr/lib/chromium/chromium \
+  --ozone-platform=wayland \
+  --use-gl=angle --use-angle=gles \
+  --enable-features=AcceleratedVideoDecoder \
+  "$@"
+LAUNCHER
+  chmod 0755 "${pkgdir}/usr/bin/chromium"
+}

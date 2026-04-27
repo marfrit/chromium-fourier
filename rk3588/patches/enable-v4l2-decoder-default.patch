@@ -1,0 +1,55 @@
+From: Markus Fritsche <mfritsche@reauktion.de>
+Subject: media: default kAcceleratedVideoDecodeLinux to enabled when
+ USE_V4L2_CODEC is the build's hardware decode path
+Date: 2026-04-26
+
+Background
+----------
+chromium-fourier targets mainline-Linux Wayland on Rockchip (RK3566 hantro,
+RK3588 VDPU381) where the only HW video decode path is V4L2 stateless
+(via the in-tree media/gpu/v4l2 stack). The build is configured with
+
+    use_vaapi      = false
+    use_v4l2_codec = true
+    use_v4lplugin  = true
+    use_linux_v4l2_only = true
+
+Without this patch, GPU-process V4L2 decode is compiled in but stays
+runtime-disabled by default. The runtime master gate
+`media::kAcceleratedVideoDecodeLinux` (the user-visible feature name is
+"AcceleratedVideoDecoder") is currently flipped to ENABLED_BY_DEFAULT only
+when `BUILDFLAG(USE_VAAPI)` is set. On a USE_V4L2_CODEC-only build the
+feature stays DISABLED_BY_DEFAULT, the linux gpu_mojo_media_client returns
+`VideoDecoderType::kUnknown`, and `<video>` falls all the way back to
+`media/filters/ffmpeg_video_decoder.cc` (software).
+
+We confirmed this by hand on the PineTab2 (RK3566 hantro): with
+`--enable-features=AcceleratedVideoDecoder` chrome correctly selects
+`V4L2VideoDecoder` for h264 main, opens /dev/video1 + /dev/media0,
+allocates 17 OUTPUT + 6 CAPTURE NV12 buffers, and runs SetExtCtrlsInit for
+H264. Without the runtime flag, none of that happens.
+
+Fix
+---
+Treat `USE_V4L2_CODEC` symmetrically with `USE_VAAPI` for the runtime
+default of the master gate. A user can still disable it via
+`--disable-features=AcceleratedVideoDecoder`.
+
+This does NOT touch the `kAcceleratedVideoDecodeLinuxGL` companion gate
+(already ENABLED_BY_DEFAULT) or any of the per-decoder selection logic in
+`media/mojo/services/gpu_mojo_media_client_linux.cc` -- that file already
+dispatches to the V4L2 decoder when `USE_V4L2_CODEC && !USE_VAAPI`, gated
+behind the master flag we are flipping here.
+
+diff --git a/media/base/media_switches.cc b/media/base/media_switches.cc
+--- a/media/base/media_switches.cc
++++ b/media/base/media_switches.cc
+@@ -749,7 +749,7 @@ BASE_FEATURE(kUnifiedAutoplay, base::FEATURE_ENABLED_BY_DEFAULT);
+ // on chromeos, but needs an experiment on linux.
+ BASE_FEATURE(kAcceleratedVideoDecodeLinux,
+              "AcceleratedVideoDecoder",
+-#if BUILDFLAG(USE_VAAPI)
++#if BUILDFLAG(USE_VAAPI) || BUILDFLAG(USE_V4L2_CODEC)
+              base::FEATURE_ENABLED_BY_DEFAULT);
+ #else
+              base::FEATURE_DISABLED_BY_DEFAULT);
