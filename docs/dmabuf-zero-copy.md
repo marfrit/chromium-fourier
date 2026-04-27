@@ -125,16 +125,35 @@ fall back to `glupload`-via-CPU.
 
 `VK_EXT_image_drm_format_modifier` does **not** have an `external_only`
 concept. Vulkan's `VkSamplerYcbcrConversion` is the spec-defined way
-to sample multi-plane formats, and it is supported by mesa `panvk` on
-Mali-Valhall (RK3588 G610+). On panvk-functional boards, ANGLE-on-Vulkan
-plus Vulkan-aware video pipelines (libplacebo, vkd3d-video) zero-copy
-NV12 with no `external_only` gymnastics. The chromium-fourier
-`rk3588/` launcher leaves Vulkan enabled for exactly this reason.
+to sample multi-plane formats, and mesa source includes the
+`panvk` driver targeting Mali-Valhall (RK3588 G610+). On a system
+where panvk is actually installed and exposes Vulkan 1.3+,
+ANGLE-on-Vulkan plus Vulkan-aware video pipelines (libplacebo,
+vkd3d-video) zero-copy NV12 with no `external_only` gymnastics.
 
-panvk on Mali-G52 r1 (Bifrost-gen2, RK3566) returns
-`VK_ERROR_INCOMPATIBLE_DRIVER` on probe (logged by chromium and mpv);
-the GLES + `external_only` workaround is all we have on that SoC
-today.
+In practice the escape hatch is currently closed by **packaging**
+rather than capability:
+
+- **Arch Linux ARM** (CoolPi 4 / Rock 5 / OrangePi 5) — the stock
+  `mesa` package is built without `-Dvulkan-drivers=panfrost`. No
+  panvk ICD ships, no `/usr/share/vulkan/icd.d/panvk_*.json` is
+  installed, and ANGLE-on-Vulkan returns `VK_ERROR_INCOMPATIBLE_DRIVER`
+  straight from the loader. Local fix: rebuild mesa with the
+  vulkan-drivers meson arg, or AUR a `vulkan-panfrost` package.
+- **Debian / Ubuntu 24.04+** — `mesa-vulkan-drivers` includes panvk
+  for RK3588 since mesa 24.x. ANGLE-on-Vulkan should work out of
+  the box.
+- **Mali-G52 r1 / Bifrost-gen2 / RK3566** — even with panvk
+  installed, the driver returns `VK_ERROR_INCOMPATIBLE_DRIVER` on
+  probe because Bifrost-gen2 is below the Vulkan support floor
+  panvk currently advertises. The GLES + `external_only` workaround
+  is all we have on that SoC today.
+- **Mali-T860 / Midgard / RK3399** — no Vulkan support in mesa at
+  all (panvk targets Bifrost+ and Valhall only). GLES-only forever.
+
+The chromium-fourier `rk3588/` launcher leaves Vulkan enabled
+optimistically — once panvk is installed, it lights up without
+re-packaging the binary.
 
 ## Upstream-targetable next moves
 
