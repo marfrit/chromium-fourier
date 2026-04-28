@@ -1,178 +1,144 @@
-# chromium-fourier
+# fourier
 
-Mainline-Linux Chromium with V4L2 hardware video decode unlocked for
-Rockchip SoCs on Wayland + panfrost / panthor. **No vendor MPP, no Mali
-blob, no panfork, no 5.10 BSP kernel.**
+> *(repo currently named `chromium-fourier`; rename to `fourier` is
+> pending the dust settling on the wider patch series)*
 
-## Why this exists
+A campaign of patches that makes mainline-Linux Wayland video playback
+on ARM Rockchip SoCs **work end-to-end on a "boring upstream" stack**
+— no vendor MPP, no Mali blob, no `panfork`, no 5.10 BSP kernel, no
+ANGLE-on-Vulkan-only Mali fallback, no NV12-to-AR24 software
+conversion in the renderer.
 
-The two existing chromium ports for Rockchip both pull in a vendor
-stack:
+Started as one patch series for chromium V4L2 hardware decode.
+Became four, because each layer of the stack had its own contributing
+bug. The patches each live in their own directory of this repo (or
+will, once the planned rename + restructure happens — see "Repository
+plan" below).
 
-- **7Ji's `chromium-mpp`** (Arch Linux ARM): forces the Rockchip 5.10
-  BSP kernel, X11, and the vendor MPP library. Works, but locks you
-  into the BSP world.
-- **JeffyCN / igel-oss-style ports**: similar — vendor `libv4l-rkmpp`
-  + libva backend, BSP kernel preferred.
+## What we found, layer by layer
 
-Stock upstream Chromium gates the V4L2 video decoder behind
-`BUILDFLAG(IS_CHROMEOS)`. On a vanilla `x86_64`/`aarch64` Linux build
-the V4L2 path compiles in but the runtime master gate
-(`media::kAcceleratedVideoDecodeLinux`) defaults to disabled when
-`USE_VAAPI` isn't set, so `<video>` falls all the way through to
-`media/filters/ffmpeg_video_decoder.cc` (software).
+| Layer | Bug | Patch |
+|---|---|---|
+| chromium runtime gate | `media::kAcceleratedVideoDecodeLinux` defaults to disabled when `USE_VAAPI` isn't set, even on a `use_v4l2_codec=true` build. Silent fallback to ffmpeg software decode. | `enable-v4l2-decoder-default.patch` |
+| chromium ozone GL surface advert | `WaylandSurfaceFactory::GetAllowedGLImplementations()` strips `kGLImplementationEGLGLES2`, blocking direct-EGL / panfrost native dmabuf import surfacing. | `wayland-allow-direct-egl-gles2.patch` |
+| chromium NV12 dmabuf import | `OzoneImageGLTexturesHolder::GetBinding` picks `GL_TEXTURE_2D` for V4L2-produced NV12 dmabufs. ANGLE rejects YUV EGLImage on non-`EXTERNAL_OES` target, force-falls to NV12→AR24 software conversion. Skia Ganesh handles `GL_TEXTURE_EXTERNAL_OES` natively; this branch was just missed. | `nv12-external-oes-on-modifier-external-only.patch` |
+| chromium V4L2 capture pool depth | `V4L2VideoDecoder::ContinueChangeResolution` requests `num_codec_reference_frames + 2` = 6 buffers for H.264 main — exactly equal to chrome's wayland pipeline depth. First scheduling jitter exhausts the pool and hard-stalls the decoder. | `v4l2-capture-pool-floor-at-16.patch` |
+| Qt 6 (`QOpenGLTextureGlyphCache`, `QRhiGles2`, `QOpenGLTextureUploader`) | `QT_CONFIG(opengles2)` build branch unconditionally picks `GL_ALPHA` as `glTexImage2D` internalFormat. `GL_ALPHA` was deprecated in OpenGL ES 3.0 (only sized formats valid). On Mali ES 3.2 contexts every text-glyph cache upload errors `GL_INVALID_VALUE`; KWin's debug callback fills the journal and adds enough load to mask other bugs. | `qt6-base-fourier` |
+| KWin 6.6.4 transaction scheduling | `Transaction::watchDmaBuf` calls `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` on every imported dmabuf and parks the transaction on a `QSocketNotifier(POLLIN)`. For V4L2-produced dmabufs the kernel returns a stub fence (because vb2 doesn't populate `dma_resv` — see kernel layer below). Even when the fence is real, the export-then-poll roundtrip adds milliseconds per frame. | `kwin-fourier` |
+| Linux kernel (`videobuf2-core`, `hantro`, `rockchip-rga`) | vb2 doesn't propagate V4L2 buffer-state-done into the dmabuf's `dma_resv` exclusive fence. Wayland compositors (and any other userspace that thinks it's doing implicit-sync the modern way) get a stub fence representing nothing real. The architectural hole that the KWin layer above is papering over. | *open* |
 
-`chromium-fourier` is a small set of patches and a build recipe that
-flips the V4L2 dispatch on for **mainline-only Rockchip systems**:
+## Validation (2026-04-28)
 
-- mainline upstream Linux kernel (no Rockchip 5.10 BSP)
-- Wayland (Plasma / KWin, sway, etc. — no X11 wrapping)
-- mesa **panfrost** (Bifrost: Mali-G31 / G52 / G57) or **panthor**
-  (Valhall: Mali-G610+) — no proprietary Mali blobs
-- in-tree V4L2 stateless decoder (`media/gpu/v4l2`) talking to the
-  hantro / VDPU381 driver via `/dev/video1` + `/dev/media0`
+End-to-end smooth 1080p30 H.264 playback under KDE Plasma 6.6.4
+Wayland on ohm (PineTab2 / RK3566 / Mali-G52 / panfrost mesa 26.0.5 /
+mainline kernel 6.19.10) with the full patch chain installed:
 
-The end goal is a Chromium binary that decodes 1080p H.264 (and AV1 /
-VP9 / HEVC where the SoC supports it) on the VPU rather than the CPU,
-on a "boring upstream Linux" stack.
+- `bbb_1080p30_h264.mp4` plays through to EOF, no stall, no slideshow.
+- Combined Chromium CPU: **~81 %** across all chrome procs vs **~131 %**
+  baseline pre-patch (NV12→AR24 software conversion). Playback at
+  ~34 % combined was briefly observed pre-stall and is reachable
+  again on a less jitter-prone compositor session.
+- KWin Wayland session also feels markedly snappier for unrelated
+  video clients (Brave on YouTube, mpv, VLC) — the kwin-fourier
+  watchDmaBuf bypass is a general-purpose latency reduction for
+  every wp_linux_dmabuf client on this hardware.
 
-## Repository layout
+## Repository plan
+
+The current github layout still reflects the chromium-only origin:
 
 ```
-chromium-fourier/
-├── README.md
+chromium-fourier/               (this repo — renaming planned)
+├── README.md                   (this file)
 ├── LICENSE
 ├── docs/
-│   ├── playback-howto.md      # mainline V4L2 video playback (mpv,
-│   │                          # gstreamer, ffplay) — the dmabuf wall
-│   └── dmabuf-zero-copy.md    # NV12 external_only investigation;
-│                              # ecosystem-wide writeup
+│   ├── dmabuf-zero-copy.md     # NV12 external_only investigation,
+│   │                           # now also chronicles the rest
+│   └── playback-howto.md       # mpv / gstreamer / ffmpeg recipes
 ├── tools/
-│   └── dmabuf-modifiers.c     # tiny EGL modifier-table dumper
-├── pinetab2/                  # RK3566 (Mali-G52 panfrost) — validated
-│   ├── PKGBUILD
-│   └── patches/
-│       ├── enable-v4l2-decoder-default.patch
-│       └── wayland-allow-direct-egl-gles2.patch
-├── rk3588/                    # RK3588 (Mali-G610 panthor) — validated
-│   ├── PKGBUILD               # launcher leaves Vulkan enabled
-│   └── patches/               # same two patches
-│       ├── enable-v4l2-decoder-default.patch
-│       └── wayland-allow-direct-egl-gles2.patch
-└── rk3399/                    # RK3399 (Mali-T860 panfrost) — validated
-    ├── PKGBUILD               # launcher Vulkan-disabled (no panvk)
-    └── patches/               # same two patches
-        ├── enable-v4l2-decoder-default.patch
-        └── wayland-allow-direct-egl-gles2.patch
+│   └── dmabuf-modifiers.c      # tiny EGL modifier-table dumper
+├── pinetab2/                   # RK3566 / Mali-G52 / panfrost — validated
+├── rk3399/                     # RK3399 / Mali-T860 / panfrost — validated
+└── rk3588/                     # RK3588 / Mali-G610 / panthor  — validated
 ```
 
-Per-board status:
+Each board directory carries a PKGBUILD plus the four chromium
+patches. The PKGBUILDs target pacman / Arch Linux ARM but the
+patches themselves are board-agnostic and apply unchanged to a
+vanilla upstream chromium tree.
 
-- **`pinetab2/`** — **validated end-to-end** on PineTab2 (RK3566 /
-  Mali-G52 Bifrost / panfrost). 1080p30 H.264 plays at ~46 % combined
-  CPU vs ~85 % renderer-only with the stock fallback.
-- **`rk3588/`** — same patches, same gn args. **V4L2 dispatch
-  validated on RK3588 (CoolPi 4 / Arch / Mali-G610 Valhall /
-  panthor / mainline kernel + KDE Wayland)**: same v2 binary as
-  PineTab2, no rebuild — patches are board-agnostic.
-  `Selected V4L2VideoDecoder, codec: h264 main, fourcc: S264`,
-  `/dev/video0` + `/dev/media0` open in GPU process. panvk Vulkan
-  probe completes cleanly on Valhall (no `VK_ERROR_INCOMPATIBLE_DRIVER`
-  unlike Bifrost-gen2 on RK3566), so the rk3588 launcher leaves
-  Vulkan enabled. CPU during 1080p30 H.264 playback is ~75 %
-  combined across chrome procs, higher than PineTab2's ~46 %; the
-  delta likely reflects the AR24 conversion still being in the path
-  on panthor + ANGLE — same dmabuf zero-copy work that's open on
-  PineTab2 applies here.
-- **`rk3399/`** — same patches, same gn args. **V4L2 dispatch
-  validated on RK3399 (Pinebook Pro / Mali-T860 / panfrost / mainline
-  kernel + KDE Wayland)**: same v2 binary as PineTab2 and RK3588, no
-  rebuild — patches are board-agnostic. `Selected V4L2VideoDecoder,
-  codec: h264 main, fourcc: S264`, `/dev/video1` + `/dev/media0` open
-  in GPU process. Mali-T860 is Midgard generation, which panvk does
-  not and will never support (panvk targets Bifrost-gen2+ and
-  Valhall), so the rk3399 launcher stays Vulkan-default-disabled
-  permanently — same stance as PineTab2 but for a different reason.
+The qt6-base-fourier and kwin-fourier patch series live in a
+sibling project repo today — those are the target of the planned
+rename + restructure, after which the layout becomes:
 
-A separate Firefox-side effort (different patch shape — Firefox has
-its own `media-rdd` / `RemoteVideoDecoder` plumbing for V4L2) will
-follow as a sibling repo.
+```
+fourier/                        (renamed)
+├── README.md
+├── chromium-fourier/           (current pinetab2/ rk3399/ rk3588/)
+├── qt6-base-fourier/           (currently in marfrit-packages)
+├── kwin-fourier/               (currently in marfrit-packages)
+└── docs/, tools/               (kept)
+```
 
-## Patches
+In the meantime, the qt6-base-fourier and kwin-fourier sources are
+maintained at https://git.reauktion.de/marfrit/marfrit-packages
+under `arch/qt6-base-fourier/` and `arch/kwin-fourier/`. They will
+move into this repo when the rename happens.
 
-Both patches live under `pinetab2/patches/` and are applied unchanged
-to a vanilla upstream chromium tree. They are architecture-independent.
+## Building (chromium part, today)
+
+```sh
+cd pinetab2          # or rk3399, rk3588
+makepkg -si
+```
+
+Downloads the upstream chromium release tarball, applies the four
+fourier patches, runs `gn gen` + `ninja`, installs into
+`/usr/lib/chromium/` plus a launcher shim at `/usr/bin/chromium`.
+**Plan for 10+ hours** of build time on an RK3566 — and roughly twice
+the RAM-to-disk swap headroom that pacman's normal heuristics
+suggest. Cross-compiling from x86_64 (the `target_cpu="x64"` branch
+in the same PKGBUILD) is significantly faster.
+
+For the qt6-base-fourier and kwin-fourier components see the
+respective READMEs in `arch/qt6-base-fourier/` and
+`arch/kwin-fourier/` of the marfrit-packages gitea repo for now.
+
+## Patches (chromium part)
 
 ### `enable-v4l2-decoder-default.patch`
-Flips `media::kAcceleratedVideoDecodeLinux` (user-visible feature name
-`AcceleratedVideoDecoder`) to `FEATURE_ENABLED_BY_DEFAULT` whenever the
-build sets `BUILDFLAG(USE_V4L2_CODEC)`, symmetric with the existing
-`USE_VAAPI` arm. Without this, a `use_v4l2_codec=true use_vaapi=false`
-build silently falls back to ffmpeg software decode at runtime even
-though the V4L2 pipeline is fully compiled in.
+Flips `media::kAcceleratedVideoDecodeLinux` (user-visible feature
+name `AcceleratedVideoDecoder`) to `FEATURE_ENABLED_BY_DEFAULT` when
+the build sets `BUILDFLAG(USE_V4L2_CODEC)`, symmetric with the
+existing `USE_VAAPI` arm.
 
 ### `wayland-allow-direct-egl-gles2.patch`
-Re-allows `kGLImplementationEGLGLES2` (i.e. `--use-gl=egl`, no ANGLE
+Re-allows `kGLImplementationEGLGLES2` (`--use-gl=egl`, no ANGLE
 shim) in `WaylandSurfaceFactory::GetAllowedGLImplementations()`. The
 downstream dispatcher in `CreateViewGLSurface` already handles that
 implementation; only the advertised list was tightened upstream.
-Restoring direct EGL is the path to surfacing panfrost's
-`EGL_EXT_image_dma_buf_import` to chrome's GL display layer, which is
-in turn what flips `gpu_feature_info.supports_nv12_gl_native_pixmap`
-to true and lets the V4L2-decoded NV12 frames go zero-copy into the
-compositor (instead of through the NV12→AR24 VPP shader path).
 
 > **Caveat**: with `is_official_build=false`, the gn default for
 > `dcheck_always_on` is `true`, and the direct EGL path FATALs at
 > `gl_context_egl.cc:241` (`DCHECK(!global_texture_share_group_)`).
 > The PKGBUILD therefore explicitly sets `dcheck_always_on=false`.
-> The launcher defaults to `--use-gl=angle --use-angle=gles` (which
-> works without DCHECK gymnastics, with a small CPU cost vs direct
-> EGL); flip to `--use-gl=egl` once you have the dcheck-off binary.
 
-## Building
+### `nv12-external-oes-on-modifier-external-only.patch`
+Extends `OzoneImageGLTexturesHolder::GetBinding` to pick
+`GL_TEXTURE_EXTERNAL_OES` whenever the EGL driver advertises the
+pixmap's DRM modifier as `external_only` for the given fourcc, in
+addition to the existing `format.PrefersExternalSampler()` branch.
+Adds a static helper `NativePixmapEGLBinding::ModifierRequiresExternalOES`
+that queries `eglQueryDmaBufModifiersEXT` and caches the answer per
+`(fourcc, modifier)` tuple.
 
-### Quickstart on the target board (aarch64, native)
-
-```sh
-cd pinetab2
-makepkg -si
-```
-
-This downloads the upstream chromium release tarball
-(`chromium-${pkgver}.tar.xz`, ~5.7 GB compressed), applies the two
-patches, runs `gn gen` + `ninja`, and installs into `/usr/lib/chromium/`
-plus a launcher shim at `/usr/bin/chromium`. **Plan for 10+ hours** on
-an RK3566 (PineTab2) — and roughly twice the RAM-to-disk swap headroom
-that pacman would normally suggest. Cross-compiling from an x86_64
-host (the `target_cpu="x64"` branch in the same PKGBUILD) is
-significantly faster.
-
-### Cross-compiling from x86_64
-
-```sh
-cd pinetab2
-CARCH=aarch64 makepkg -i
-```
-
-Requires the aarch64 toolchain (`aarch64-linux-gnu-gcc` / `clang
---target=aarch64`). Or just build on the x86_64 host first
-(`makepkg -si` on x86_64) to validate the patch chain before
-committing the long aarch64 run.
-
-### Bumping pkgver
-
-Patch line numbers drift between chromium minor releases. After
-bumping `pkgver`:
-
-1. Try `makepkg --noextract` once — if `prepare()`'s `patch -p1`
-   complains about offset, the hunk still applies but the diff was
-   regenerated; commit the new patch.
-2. If `patch -p1` fails outright (`Hunk #N FAILED`), open the target
-   file and re-emit the hunk by hand. The two affected files
-   (`media/base/media_switches.cc` and
-   `ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc`) are
-   small and the conditional block being patched is stable.
+### `v4l2-capture-pool-floor-at-16.patch`
+Floors `v4l2_num_buffers` at 16 in `V4L2VideoDecoder::ContinueChangeResolution`
+when V4L2 is the buffer allocator. Default
+(`num_codec_reference_frames + 2`) is 6 for H.264 main, equal to
+chrome's wayland compositor pipeline depth — first scheduling jitter
+event exhausts the pool. The `std::max` preserves correctness for
+high-DPB codecs (HEVC, VP9 with deeper reference counts).
 
 ## Runtime
 
@@ -186,10 +152,9 @@ The launcher shim (`/usr/bin/chromium`) defaults to:
 ```
 
 Vulkan is disabled by default because **panvk on RK3566 (Mali-G52
-Bifrost) returns `VK_ERROR_INCOMPATIBLE_DRIVER`** on chromium's probe
-and breaks V4L2 dispatch downstream (chrome falls back to FFmpeg
-software). Override paths if you're working on a board where Vulkan
-actually works:
+Bifrost)** returns `VK_ERROR_INCOMPATIBLE_DRIVER` on chromium's probe
+and breaks V4L2 dispatch downstream. Override paths if you're working
+on a board where Vulkan actually works (`rk3588/` defaults Vulkan-on):
 
 | User flag                     | Effect                                |
 |-------------------------------|---------------------------------------|
@@ -202,34 +167,25 @@ actually works:
 The launcher detects any of those on the command line and skips its
 own `--disable-features=Vulkan`, so the user's intent always wins.
 
-## Adjacent: playing video outside the browser
+## Adjacent
 
-If you only want to watch H.264 / HEVC / VP9 / AV1 files from the
-command line (mpv, gstreamer, ffmpeg), see
-[`docs/playback-howto.md`](docs/playback-howto.md). Same hardware, same
-underlying V4L2 stack, separate dmabuf wall — that doc captures the
-working invocations and what the wall is.
+- `docs/dmabuf-zero-copy.md` — the panfrost / panthor `external_only`
+  investigation; the original deep-dive that produced patch 3 and
+  pointed at the rest of the chain.
+- `docs/playback-howto.md` — mpv / gstreamer / ffmpeg invocations
+  that work on the same V4L2 stack outside the browser.
+- `tools/dmabuf-modifiers.c` — a 100-line EGL probe that dumps the
+  available NV12 modifiers and their `external_only` flags. Useful
+  for sanity-checking what your panfrost / panthor / mesa version
+  advertises before you start patching.
 
-## Validation
-
-Tested end-to-end on **PineTab2** (RK3566 / Mali-G52 / panfrost /
-mainline kernel) playing
-`bbb_1080p30_h264.mp4` from `file://`:
-
-- `Selected V4L2VideoDecoder for video decoding, codec: h264, profile:
-  h264 main, coded size: [1920,1080]`
-- `Open(): Using a stateless API for profile: h264 main and fourcc:
-  S264`
-- `AllocateInputBuffers(): Requesting: 17 OUTPUT buffers of type
-  V4L2_MEMORY_MMAP`
-- `SetExtCtrlsInit(): Setting EXT_CTRLS for H264`
-- `SetupOutputFormat(): Output (CAPTURE queue) candidate: NV12`
-- `/dev/video1` + `/dev/media0` open in the GPU process
-- Combined Chromium CPU during playback: ~46 % across all chrome
-  procs, vs ~85 % on a single renderer with stock Chromium falling
-  through to software FFmpeg.
+A separate Firefox-side effort (`firefox-fourier`, in
+marfrit-packages) carries the same V4L2 stateless unlock for
+Firefox 150 — different patch shape because Firefox's media-rdd /
+RemoteVideoDecoder plumbing is independent.
 
 ## License
 
 The patches are released under the same BSD-3-Clause as Chromium
-itself. See `LICENSE`.
+itself. See `LICENSE`. The qt6-base-fourier and kwin-fourier
+patches are released under the LGPL-2.1+ matching their upstreams.

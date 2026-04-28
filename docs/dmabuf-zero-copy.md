@@ -327,3 +327,106 @@ The KWin investigation continues in
 (local). Headline experiment: WAYLAND_DEBUG on chrome + KWin during
 the stall window, looking for the missing `wl_buffer.release` or
 `wp_presentation_feedback` event around the 6-second mark.
+
+## Final 2026-04-28 update — campaign closes
+
+Two more patches landed and the chrome stall is gone end-to-end on
+KWin Plasma.
+
+### kwin-fourier — `Transaction::watchDmaBuf` is the wall
+
+Source-grep + gdb-attach during a chrome stall narrowed the KWin bug
+to `Transaction::watchDmaBuf` (`src/wayland/transaction.cpp:265`),
+which calls `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` on every plane of every
+imported dmabuf and parks the transaction on a
+`QSocketNotifier(POLLIN)` waiting for the resulting sync_file fd to
+become readable. For V4L2 hantro CAPTURE buffers the fence either
+signals so late that chrome's V4L2 capture pool exhausts, or — given
+what we found one layer down (see kernel section below) — never
+signals at all in the spec-clean way the kernel claims it does.
+
+`kwin-fourier`'s patch no-ops `watchDmaBuf` to test the hypothesis.
+Pre-patch chrome stalled at ~3 s (with the GL_ALPHA noise) or ~6 s
+(after qt6-base-fourier). Post-patch chrome stalled at ~22 s — the
+fence wait was contributing, but a *second* contributor was now
+exposed.
+
+### chromium-fourier patch 4/4 — V4L2 capture pool floor
+
+Live state during the 22 s stall (gdb-attach to chrome's GPU
+process): all 6 V4L2 capture buffers held by chrome's pipeline,
+`V4L2DevicePoller` parked because there was nothing to wait for,
+KWin idle in `ppoll` because chrome had nothing new to compose.
+Pure pool exhaustion under bursty compositor scheduling.
+
+Chrome's `V4L2VideoDecoder::ContinueChangeResolution` (`media/gpu/v4l2/v4l2_video_decoder.cc:1204`)
+sized the capture pool as `num_codec_reference_frames + 2`, which
+yields exactly 6 for H.264 main — the same depth as chrome's
+wayland subsurface pipeline. `chromium-fourier`'s
+`v4l2-capture-pool-floor-at-16.patch` floors the request at 16
+buffers via `std::max`, preserving correctness for high-DPB codecs.
+Memory cost: +30 MB resident at 1080p NV12 — non-issue on 4 GB
+platforms.
+
+### Kernel side — the architectural hole
+
+The hypothesis behind `watchDmaBuf`'s misbehavior turned out to be
+load-bearing: **vb2 does not propagate V4L2 producer state into the
+dmabuf's `dma_resv` reservation_object.** Source-grep across mainline
+6.12 confirms zero `dma_resv` / `dma_fence` / `sync_file` references
+in `drivers/media/common/videobuf2/` and zero in
+`drivers/media/platform/verisilicon/` (hantro). vb2's buffer-state
+machine (`VB2_BUF_STATE_QUEUED → ACTIVE → DONE`) predates dma-buf
+and was never wired to the modern fence infrastructure.
+
+When KWin asks the kernel `"give me a sync_file representing the
+write fences on this dmabuf"`, the dma-buf core's
+`dma_buf_export_sync_file` finds nothing populated and substitutes
+`dma_fence_get_stub()` — a stub fence that's permanently signaled.
+The compositor's wait-then-proceed dance therefore "works" on
+hantro buffers in the sense that it doesn't deadlock forever, but
+it represents nothing real about the producer's state. The wait is
+pure latency cost, paid every frame, on every wayland video client
+on every Rockchip board running mainline.
+
+The kwin-fourier blanket-bypass is correctness-equivalent here
+**because the producer has already finished writing before chrome
+attaches** (Wayland clients are required by spec to ensure this).
+But the kwin-fourier shape is upstream-troublesome: the patch
+removes a defense without adding the corresponding kernel-side
+guarantee. The right upstream pair is:
+
+1. **Per-driver `dma_resv` fence wiring** in `hantro_drv.c` and
+   `rockchip_rga` (and any other vb2 producer that exports dmabufs
+   to userspace), populating an exclusive write fence at QBUF and
+   signaling it at `vb2_buffer_done`. ~30-line driver patches each.
+2. **KWin patch** that either uses `poll(POLLIN)` directly on the
+   dmabuf fd (the dma-buf spec's implicit-sync primitive) instead of
+   the `EXPORT_SYNC_FILE`+`QSocketNotifier` roundtrip, or adds a
+   short timeout on the existing path. With the kernel side fixed,
+   the wait genuinely waits on real fences and the timeout is
+   defensive against future kernels.
+
+Both upstream sides are filable. The chromium-fourier campaign
+ships kwin-fourier today as a working test fixture; the broader
+correctness story is the kernel-and-compositor patch pair.
+
+### Validation outcome
+
+End-to-end smooth 1080p30 H.264 playback under KDE Plasma 6.6.4
+Wayland on ohm (PineTab2 / RK3566 / hantro mainline 6.19.10 /
+panfrost mesa 26.0.5) with the full chain installed:
+
+- `chromium-fourier 149-r3` (4 patches: V4L2 default + direct
+  EGL/GLES2 + NV12 EXTERNAL_OES + V4L2 pool floor)
+- `qt6-base-fourier 1:6.11.0-2` (3 patches: GL_ALPHA → GL_R8 on ES 3.x)
+- `kwin-fourier 1:6.6.4-1` (1 patch: watchDmaBuf bypass)
+
+bbb_1080p30_h264.mp4 plays through to EOF. Combined Chromium CPU
+~81 % across all chrome procs vs ~131 % pre-patch baseline. Zero
+`GL_INVALID_VALUE` in the journal during playback. KWin overhead
+~9 % steady. 58 live dmabuf fds during playback — 16-buffer V4L2
+pool cycling healthy. Brave's YouTube playback on the same
+compositor session also feels markedly snappier — kwin-fourier is
+a general-purpose latency reduction for every wp_linux_dmabuf
+client on Mali-class hardware, not a chrome-specific fix.
