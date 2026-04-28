@@ -271,3 +271,59 @@ The chromium-fourier patch series is the right thing on the right
 hardware; the residual stall is a KWin bug that this campaign cannot
 fix from inside chromium. A pivot to identify and patch the offending
 `glTexImage2D(GL_ALPHA)` site in KWin is on the followup list.
+
+### Update 2026-04-28 — GL_ALPHA was Qt 6, not KWin; the stall remains
+
+Source-grep traced the `glTexImage2D(internalFormat=GL_ALPHA)` calls
+to **Qt 6** rather than KWin. Three sites in qtbase 6.11.0 hard-code
+`GL_ALPHA` whenever `QT_CONFIG(opengles2)` is built in (every aarch64
+Linux distro), with no runtime check for the actual context's ES
+version:
+
+- `src/opengl/qopengltextureglyphcache.cpp:111-117` — text glyph
+  cache, the primary KDE-decoration trigger.
+- `src/gui/rhi/qrhigles2.cpp:1373-1378` — Qt-Quick-RHI's
+  `RED_OR_ALPHA8` path.
+- `src/opengl/qopengltextureuploader.cpp:253-275` — `Format_Alpha8`
+  and `Format_Grayscale8` cases short-circuit on `isOpenGLES()`
+  before reaching the existing TextureSwizzle fallback.
+
+A patch series correcting all three (`qt6-base-fourier`, three small
+runtime-checks gated on `caps.gles && caps.ctxMajor >= 3` or
+`format().majorVersion() >= 3`) was built and installed on ohm. Fresh
+session, post-relogin, idle: zero `GL_INVALID_VALUE` in the journal.
+
+**The chrome stall, however, persisted** — at ~6 s instead of ~3 s,
+so the GL_ALPHA churn was contributing some load but wasn't the
+primary cause.
+
+A definitive A/B against weston closed the loop:
+
+| Path | Result |
+|---|---|
+| `ffmpeg -hwaccel v4l2request -f null` | ✓ 36 fps, clean |
+| `mpv --vo=null --hwdec=v4l2request` | ✓ decode-only, clean |
+| `mpv --vo=drm --hwdec=v4l2request` (KMS scanout, no compositor) | ✓ 0.7 % drops in 19 s |
+| chrome v4 under **weston** | ✓ plays through, ~96 % CPU |
+| chrome v4 under KWin (post-Qt-fix) | ✗ stall @ ~6 s |
+| `mpv --vo=gpu-next --hwdec=v4l2request` under KWin | ✗ 76 % drops, slideshow |
+
+Same chrome v4 binary, same panfrost mesa, same V4L2 driver, same
+hardware — only swapping KWin → weston turns the stall off. The
+Wayland *protocol* is fine; KWin's *implementation* of it on
+panfrost ES 3.2 + fast video clients has a second, structurally
+deeper bug that the GL_ALPHA noise was masking.
+
+The chromium-fourier patch series stands on its own merits — under
+weston, the patched binary plays the bbb sample end-to-end with the
+V4L2VideoDecoder + S264 + NV12 pipeline engaged. The lower-CPU
+fast-tile result (~34.7 %) is reachable on KWin too once KWin's
+remaining bug is fixed; weston advertises only the LINEAR modifier,
+so chrome falls back to LINEAR composite there — still zero-copy,
+just less efficient than the AFBC path KWin enables.
+
+The KWin investigation continues in
+[`KWIN_PIVOT.md`](https://git.reauktion.de/marfrit/marfrit-packages/src/branch/main/arch/chromium-fourier/KWIN_PIVOT.md)
+(local). Headline experiment: WAYLAND_DEBUG on chrome + KWin during
+the stall window, looking for the missing `wl_buffer.release` or
+`wp_presentation_feedback` event around the 6-second mark.
