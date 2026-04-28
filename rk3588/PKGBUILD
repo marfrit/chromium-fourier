@@ -19,7 +19,7 @@
 
 pkgname=chromium-fourier
 pkgver=147.0.7727.116
-pkgrel=2
+pkgrel=3
 epoch=1
 pkgdesc='Chromium with V4L2VDA HW video decode unlocked for mainline Linux Wayland on Rockchip'
 arch=('aarch64' 'x86_64')
@@ -86,8 +86,10 @@ source=(
   'patches/enable-v4l2-decoder-default.patch'
   'patches/wayland-allow-direct-egl-gles2.patch'
   'patches/nv12-external-oes-on-modifier-external-only.patch'
+  'patches/v4l2-capture-pool-floor-at-16.patch'
 )
 sha256sums=(
+  'SKIP'
   'SKIP'
   'SKIP'
   'SKIP'
@@ -97,14 +99,14 @@ sha256sums=(
 prepare() {
   cd "${srcdir}/chromium-${pkgver}"
 
-  # Fourier patch 1/3: flip kAcceleratedVideoDecodeLinux's default to
+  # Fourier patch 1/4: flip kAcceleratedVideoDecodeLinux's default to
   # enabled when USE_V4L2_CODEC is the build's HW decode path. Without
   # this the runtime master gate stays off on USE_V4L2_CODEC-only builds
   # and chrome silently falls back to ffmpeg software decode. See the
   # patch header for the validation log on RK3566 hantro.
   patch -Np1 -i "${srcdir}/patches/enable-v4l2-decoder-default.patch"
 
-  # Fourier patch 2/3: re-allow the direct EGL/GLES2 path in the Wayland
+  # Fourier patch 2/4: re-allow the direct EGL/GLES2 path in the Wayland
   # ozone surface factory so panfrost's EGL_EXT_image_dma_buf_import
   # surfaces to chrome's GL display, lighting up the NV12 zero-copy
   # native-pixmap pipeline. The launcher defaults to ANGLE (DCHECK in
@@ -113,7 +115,7 @@ prepare() {
   # is_official_build=true and want the lower-CPU pipeline.
   patch -Np1 -i "${srcdir}/patches/wayland-allow-direct-egl-gles2.patch"
 
-  # Fourier patch 3/3: pick GL_TEXTURE_EXTERNAL_OES for NV12 dmabufs
+  # Fourier patch 3/4: pick GL_TEXTURE_EXTERNAL_OES for NV12 dmabufs
   # whose DRM modifier is advertised external_only by the EGL driver.
   # On panfrost / panthor every NV12 modifier (LINEAR + AFBC ×2 + AFRC)
   # is external_only; chromium's default OzoneImageGLTexturesHolder
@@ -124,6 +126,15 @@ prepare() {
   # to ~34.7% (~3.8x). See docs/dmabuf-zero-copy.md "Status: patch 3/3
   # landed" for the validation log.
   patch -Np1 -i "${srcdir}/patches/nv12-external-oes-on-modifier-external-only.patch"
+
+  # Fourier patch 4/4: floor the V4L2 capture pool at 16 buffers. Default
+  # (num_codec_reference_frames + 2) is 6 for H.264 main, exactly equal to
+  # chrome's wayland pipeline depth — first scheduling jitter event
+  # exhausts the pool and hard-stalls the decoder. Validated on ohm:
+  # pre-patch chrome v4 stalled @22s under kwin-fourier; post-patch
+  # plays through end-to-end at the recorded ~34.7% combined CPU number.
+  # +30 MB resident at 1080p NV12 — non-issue on 4 GB platforms.
+  patch -Np1 -i "${srcdir}/patches/v4l2-capture-pool-floor-at-16.patch"
 
   # Use system node, system java
   case "$CARCH" in

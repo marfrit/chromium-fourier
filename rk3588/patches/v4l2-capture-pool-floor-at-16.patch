@@ -1,0 +1,76 @@
+From: Markus Fritsche <mfritsche@reauktion.de>
+Subject: [PATCH] v4l2_video_decoder: floor capture pool at 16 buffers
+Date: 2026-04-28
+
+Background
+----------
+`V4L2VideoDecoder::ContinueChangeResolution` (media/gpu/v4l2/v4l2_video_decoder.cc:1204)
+sizes the V4L2 CAPTURE buffer pool as `num_codec_reference_frames + 2`
+when V4L2 is the buffer allocator (V4L2_MEMORY_MMAP). For H.264 main
+profile the codec reference count is 4, yielding a pool of 6 buffers.
+
+Chrome's pipeline depth between V4L2 dequeue and `wl_buffer.release`
+on a wayland compositor is also approximately 6:
+
+   1. V4L2 dequeue side (one buffer being decoded by the driver)
+   2. Media frame queue (one frame in transit to the renderer)
+   3. Viz compositor (one frame being prepared for submission)
+   4. wl_subsurface attached and pending parent commit
+   5. wl_subsurface attached, parent committed, awaiting compositor
+      paint
+   6. wl_buffer waiting for the compositor's release event after
+      its present cycle
+
+Sum equals capture pool size, leaving zero headroom. Any single
+compositor scheduling jitter event — a missed vsync, a brief
+contention spike — exhausts the pool. The V4L2 driver has no free
+buffers to fill, the V4L2DevicePoller stops polling, the decoder
+backend parks waiting for a free CAPTURE buffer that will never
+come back, and the pipeline deadlocks. mpv with `--vo=gpu-next`
+on the same compositor merely slideshows (~76 % drop rate) because
+its single-surface attach pattern has shorter pipeline depth;
+chrome's wp_subsurface flow exhausts faster and fully deadlocks.
+
+Validation on ohm (RK3566 PineTab2 / hantro mainline 6.19.10 /
+panfrost mesa 26.0.5):
+
+- Pre-patch: chrome v4 stalls at ~6 s under stock KWin 6.6.4.
+- Pre-patch + kwin-fourier (watchDmaBuf bypass): stalls at ~22 s.
+- Same chrome v4 binary under weston: plays through end-to-end
+  (no stall, ~96 % CPU vs KWin's ~50 % when not stalled).
+
+The compositor-side bugs (KWin's watchDmaBuf fence wait, Qt 6
+GL_ALPHA on ES 3) have their own patch series (qt6-base-fourier,
+kwin-fourier) — but the V4L2 capture pool depth is itself too
+shallow for any wayland compositor on this hardware to reliably
+keep up. Bumping the floor to 16 gives ~10 buffers of headroom
+beyond the H.264 case while still respecting high-DPB codecs
+(HEVC, VP9 with deeper reference counts) via the std::max.
+
+Memory cost at 1920x1080 NV12 is +30 MB resident (10 extra buffers
+× 3 MB each). On the 4 GB RK3566 reference platform that does not
+move the needle.
+
+Fix
+---
+Floor `v4l2_num_buffers` at 16 when V4L2 is the buffer allocator.
+The std::max preserves correctness for codecs requiring more than
+14 reference frames.
+
+diff --git a/media/gpu/v4l2/v4l2_video_decoder.cc b/media/gpu/v4l2/v4l2_video_decoder.cc
+--- a/media/gpu/v4l2/v4l2_video_decoder.cc
++++ b/media/gpu/v4l2/v4l2_video_decoder.cc
+@@ -1199,11 +1199,16 @@
+   // If we don't use driver-allocated buffers, request as many as possible
+   // (VIDEO_MAX_FRAME) since they are shallow allocations. Otherwise, allocate
+   // |num_codec_reference_frames| plus one for the video frame being decoded,
+   // and one for our client (presumably an ImageProcessor).
++  // chromium-fourier: floor the V4L2 capture pool at 16 to give us
++  // headroom against KWin/wayland compositor scheduling jitter. Default
++  // (num_codec_reference_frames + 2) yields 6 for H.264 main, equal to
++  // chrome's pipeline depth — first jitter event exhausts the pool and
++  // hard-stalls the decoder. See chromium-fourier KWIN_PIVOT.md.
+   const size_t v4l2_num_buffers = use_v4l2_allocated_buffers
+-                                      ? num_codec_reference_frames + 2
++                                      ? std::max(num_codec_reference_frames + 2, size_t{16})
+                                       : VIDEO_MAX_FRAME;
